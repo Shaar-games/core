@@ -81,7 +81,11 @@ class HueBaseEntity(Entity):  # pylint: disable=home-assistant-enforce-class-mod
             self.controller.subscribe(
                 self._handle_event,
                 self.resource.id,
-                (EventType.RESOURCE_UPDATED, EventType.RESOURCE_DELETED),
+                (
+                    EventType.RESOURCE_ADDED,
+                    EventType.RESOURCE_UPDATED,
+                    EventType.RESOURCE_DELETED,
+                ),
             )
         )
         # also subscribe to device update event to catch device changes (e.g. name)
@@ -137,6 +141,8 @@ class HueBaseEntity(Entity):  # pylint: disable=home-assistant-enforce-class-mod
                 ent_reg.async_remove(self.entity_id)
             return
 
+        if resource.id == self.resource.id:
+            self.resource = resource
         self.logger.debug("Received status update for %s", self.entity_id)
         self._check_availability()
         self.on_update()

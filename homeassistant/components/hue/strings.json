@@ -172,6 +172,16 @@
       "message": "Failed to unload the Hue bridge"
     }
   },
+  "issues": {
+    "deprecated_smart_plug_light": {
+      "description": "The Philips Hue smart plug `{light}` is now available as the outlet switch `{switch}`. The light entity is deprecated and will be removed.\n\nUpdate your dashboards, automations, and scripts to use `{switch}`. For on/off actions, use `switch.turn_on` or `switch.turn_off`. Then disable the old light entity.",
+      "title": "A Philips Hue smart plug's light entity is deprecated"
+    },
+    "deprecated_smart_plug_light_used": {
+      "description": "[%key:component::hue::issues::deprecated_smart_plug_light::description%]\n\nThe following automations or scripts reference the light entity:\n\n{items}",
+      "title": "[%key:component::hue::issues::deprecated_smart_plug_light::title%]"
+    }
+  },
   "options": {
     "step": {
       "init": {

@@ -1,12 +1,80 @@
 """Helper functions for Philips Hue v2."""
 
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 from aiohue.v2 import HueBridgeV2
+from aiohue.v2.controllers.events import EventType
+from aiohue.v2.models.device import Device, DeviceArchetypes
+from aiohue.v2.models.light import Light
 from aiohue.v2.models.motion_area_configuration import MotionAreaConfiguration
 
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.util import color as color_util
 
 from ..const import DOMAIN
+
+if TYPE_CHECKING:
+    from ..bridge import HueConfigEntry
+
+
+def is_smart_plug(device: Device) -> bool:
+    """Return whether the device is a smart plug."""
+    product = device.product_data
+    return product.product_archetype is DeviceArchetypes.PLUG or (
+        # The bridge reports the innr SP 222 as a classic bulb.
+        product.manufacturer_name == "innr" and product.model_id == "SP 222"
+    )
+
+
+@callback
+def async_subscribe_lights(
+    config_entry: HueConfigEntry,
+    api: HueBridgeV2,
+    add_light: Callable[[Light, Device], None],
+) -> None:
+    """Discover lights when their owning device advertises the light service."""
+    lights = api.lights
+    pending: dict[str, set[str]] = {}
+    registered: set[str] = set()
+
+    @callback
+    def async_handle_light(event_type: EventType, light: Light) -> None:
+        if event_type == EventType.RESOURCE_DELETED:
+            registered.discard(light.id)
+            if pending_lights := pending.get(light.owner.rid):
+                pending_lights.discard(light.id)
+                if not pending_lights:
+                    del pending[light.owner.rid]
+            return
+        if light.id in registered:
+            return
+        if (device := lights.get_device(light.id)) is None:
+            pending.setdefault(light.owner.rid, set()).add(light.id)
+            return
+        add_light(light, device)
+        registered.add(light.id)
+
+    @callback
+    def async_handle_device(event_type: EventType, device: Device) -> None:
+        pending_lights = pending.pop(device.id, set())
+        if event_type == EventType.RESOURCE_DELETED:
+            registered.difference_update(device.lights)
+            return
+        for light_id in pending_lights:
+            if (light := lights.get(light_id)) is not None:
+                async_handle_light(event_type, light)
+
+    for light in lights:
+        async_handle_light(EventType.RESOURCE_ADDED, light)
+    config_entry.async_on_unload(
+        lights.subscribe(
+            async_handle_light,
+            event_filter=(EventType.RESOURCE_ADDED, EventType.RESOURCE_DELETED),
+        )
+    )
+    config_entry.async_on_unload(api.devices.subscribe(async_handle_device))
 
 
 def normalize_hue_brightness(brightness: float | None) -> float | None:

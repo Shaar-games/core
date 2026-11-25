@@ -21,7 +21,8 @@ from homeassistant.components.light import (
     LightEntityDescription,
     LightEntityFeature,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import ATTR_ENTITY_ID, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -31,11 +32,18 @@ from ..bridge import HueBridge, HueConfigEntry
 from ..const import DOMAIN
 from .entity import HueBaseEntity
 from .helpers import (
+    is_smart_plug,
     normalize_hue_brightness,
     normalize_hue_colortemp,
     normalize_hue_transition,
 )
 from .light import FALLBACK_MAX_MIREDS, FALLBACK_MIN_MIREDS
+
+
+@callback
+def _is_member_registry_event(data: er.EventEntityRegistryUpdatedData) -> bool:
+    """Return whether the registry event concerns a light or outlet."""
+    return data["entity_id"].startswith(("light.", "switch."))
 
 
 async def async_setup_entry(
@@ -131,6 +139,36 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             self.async_on_remove(
                 self.api.lights.subscribe(self._handle_event, light_ids)
             )
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                er.EVENT_ENTITY_REGISTRY_UPDATED,
+                self._async_handle_member_registry_update,
+                event_filter=_is_member_registry_event,
+            )
+        )
+
+    @callback
+    def _async_handle_member_registry_update(
+        self, event: Event[er.EventEntityRegistryUpdatedData]
+    ) -> None:
+        """Refresh member IDs when an entity in this group changes."""
+        entity_id = event.data["entity_id"]
+        if (entry := er.async_get(self.hass).async_get(entity_id)) is None:
+            if (state := self.hass.states.get(self.entity_id)) and (
+                entity_id in state.attributes.get(ATTR_ENTITY_ID, ())
+            ):
+                self.async_write_ha_state()
+            return
+
+        if (
+            entry.platform == DOMAIN
+            and entry.config_entry_id == self.bridge.config_entry.entry_id
+            and any(
+                light.id == entry.unique_id
+                for light in self.controller.get_lights(self.resource.id)
+            )
+        ):
+            self.async_write_ha_state()
 
     @property
     @override
@@ -145,18 +183,13 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
         scenes = {
             x.metadata.name for x in self.api.scenes if x.group.rid == self.hue_group.id
         }
-        light_resource_ids = tuple(
-            x.id for x in self.controller.get_lights(self.resource.id)
-        )
-        light_names, light_entities = self._get_names_and_entity_ids_for_resource_ids(
-            light_resource_ids
-        )
+        light_names, light_entities = self._get_names_and_entity_ids()
         return {
             "is_hue_group": True,
             "hue_scenes": scenes,
             "hue_type": self.hue_group.type.value,
             "lights": light_names,
-            "entity_id": light_entities,
+            ATTR_ENTITY_ID: light_entities,
             "dynamics": self._dynamic_mode_active,
         }
 
@@ -363,17 +396,24 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             self._attr_color_mode = ColorMode.ONOFF
 
     @callback
-    def _get_names_and_entity_ids_for_resource_ids(
-        self, resource_ids: tuple[str]
-    ) -> tuple[set[str], set[str]]:
-        """Return the names and entity ids for the given Hue (light) resource IDs."""
+    def _get_names_and_entity_ids(self) -> tuple[set[str], set[str]]:
+        """Return the names and entity IDs of the group's Hue light resources."""
         ent_reg = er.async_get(self.hass)
         light_names: set[str] = set()
         light_entities: set[str] = set()
-        for resource_id in resource_ids:
-            light_names.add(self.controller.get_device(resource_id).metadata.name)
-            if entity_id := ent_reg.async_get_entity_id(
-                self.platform.domain, DOMAIN, resource_id
+        for light in self.controller.get_lights(self.resource.id):
+            if (device := self.controller.get_device(light.id)) is None:
+                continue
+            light_names.add(device.metadata.name)
+            entity_id = ent_reg.async_get_entity_id(Platform.LIGHT, DOMAIN, light.id)
+            if is_smart_plug(device) and (
+                entity_id is None
+                or (legacy := ent_reg.async_get(entity_id)) is None
+                or legacy.disabled
             ):
+                entity_id = ent_reg.async_get_entity_id(
+                    Platform.SWITCH, DOMAIN, light.id
+                )
+            if entity_id is not None:
                 light_entities.add(entity_id)
         return light_names, light_entities

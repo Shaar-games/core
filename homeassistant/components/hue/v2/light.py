@@ -4,8 +4,8 @@ import asyncio
 from typing import Any, override
 
 from aiohue import HueBridgeV2
-from aiohue.v2.controllers.events import EventType
 from aiohue.v2.controllers.lights import LightsController
+from aiohue.v2.models.device import Device
 from aiohue.v2.models.feature import EffectStatus, TimedEffectStatus
 from aiohue.v2.models.light import Light
 
@@ -24,15 +24,20 @@ from homeassistant.components.light import (
     LightEntityFeature,
     filter_supported_color_modes,
 )
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.group import IntegrationSpecificGroup
 from homeassistant.util import color as color_util
 
 from ..bridge import HueBridge, HueConfigEntry
+from ..const import DOMAIN
 from .entity import HueBaseEntity
 from .helpers import (
+    async_subscribe_lights,
     hue_brightness_to_ha,
+    is_smart_plug,
     normalize_hue_brightness,
     normalize_hue_colortemp,
     normalize_hue_transition,
@@ -69,9 +74,21 @@ async def async_setup_entry(
     bridge = config_entry.runtime_data
     api: HueBridgeV2 = bridge.api
     controller: LightsController = api.lights
+    registry = er.async_get(hass)
 
-    def make_light_entities(resource: Light) -> list[HueBaseEntity]:
-        """Create the light entity plus a segment entity per gradient point."""
+    @callback
+    def async_add_light(resource: Light, device: Device) -> None:
+        """Add the light and its gradient segments, if any."""
+        if is_smart_plug(device):
+            legacy_id = registry.async_get_entity_id(
+                Platform.LIGHT, DOMAIN, resource.id
+            )
+            if (
+                legacy_id is None
+                or (legacy := registry.async_get(legacy_id)) is None
+                or legacy.disabled
+            ):
+                return
         entities: list[HueBaseEntity] = [HueLight(bridge, controller, resource)]
         if resource.gradient is not None:
             writer = HueGradientWriter(bridge, controller, resource)
@@ -79,21 +96,9 @@ async def async_setup_entry(
                 HueGradientSegmentLight(bridge, controller, resource, writer, number)
                 for number in range(1, resource.gradient.points_capable + 1)
             )
-        return entities
+        async_add_entities(entities)
 
-    @callback
-    def async_add_light(event_type: EventType, resource: Light) -> None:
-        """Add Hue Light."""
-        async_add_entities(make_light_entities(resource))
-
-    # add all current items in controller
-    async_add_entities(
-        entity for light in controller for entity in make_light_entities(light)
-    )
-    # register listener for new lights
-    config_entry.async_on_unload(
-        controller.subscribe(async_add_light, event_filter=EventType.RESOURCE_ADDED)
-    )
+    async_subscribe_lights(config_entry, api, async_add_light)
 
 
 # pylint: disable-next=home-assistant-enforce-class-module
@@ -445,7 +450,7 @@ class HueGradientSegmentLight(HueBaseEntity, LightEntity):
     @override
     def on_update(self) -> None:
         """Handle a state update of the light reported by the bridge."""
-        self._writer.resource_updated()
+        self._writer.resource_updated(self.resource)
 
 
 class HueGradientWriter:
@@ -497,8 +502,9 @@ class HueGradientWriter:
         await asyncio.shield(self._flush_task)
 
     @callback
-    def resource_updated(self) -> None:
+    def resource_updated(self, resource: Light) -> None:
         """Handle a state update of the light reported by the bridge."""
+        self._resource = resource
         self._written_points = None
 
     async def _async_flush(self) -> None:
