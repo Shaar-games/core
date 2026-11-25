@@ -11,6 +11,7 @@ from aiohue.v2.controllers.config import (
     MotionAreaConfigurationController,
 )
 from aiohue.v2.controllers.events import EventType
+from aiohue.v2.controllers.lights import LightsController
 from aiohue.v2.controllers.sensors import (
     LightLevel,
     LightLevelController,
@@ -19,6 +20,8 @@ from aiohue.v2.controllers.sensors import (
 )
 from aiohue.v2.models.behavior_instance import PresenceMimickingState
 from aiohue.v2.models.behavior_script import BehaviorScriptCategory
+from aiohue.v2.models.device import Device
+from aiohue.v2.models.light import Light
 
 from homeassistant.components.switch import (
     SwitchDeviceClass,
@@ -31,9 +34,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .bridge import HueBridge, HueConfigEntry
-from .const import DOMAIN
+from .const import CONF_SMART_PLUGS_AS_SWITCHES, DOMAIN
 from .v2.entity import HueBaseEntity
-from .v2.helpers import get_motion_area_device_info
+from .v2.helpers import get_motion_area_device_info, is_configured_as_switch
 
 
 async def async_setup_entry(
@@ -119,6 +122,77 @@ async def async_setup_entry(
     register_items(
         api.config.motion_area_configuration, HueMotionAreaConfigurationEnabledEntity
     )
+    if config_entry.options.get(CONF_SMART_PLUGS_AS_SWITCHES):
+        _async_register_smart_plugs(bridge, api, async_add_entities)
+
+
+@callback
+def _async_register_smart_plugs(
+    bridge: HueBridge,
+    api: HueBridgeV2,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Register opted-in plug resources as switches."""
+    config_entry = bridge.config_entry
+    lights = api.lights
+    pending: dict[str, set[str]] = {}
+
+    @callback
+    def async_add_plug(event_type: EventType, light: Light) -> None:
+        if not is_configured_as_switch(light, config_entry):
+            return
+        if lights.get_device(light.id) is None:
+            pending.setdefault(light.owner.rid, set()).add(light.id)
+            return
+        async_add_entities([HueSmartPlug(bridge, lights, light)])
+
+    @callback
+    def async_retry_plugs(event_type: EventType, device: Device) -> None:
+        for light_id in pending.pop(device.id, set()):
+            if (light := lights.get(light_id)) is not None:
+                async_add_plug(event_type, light)
+
+    for light in lights:
+        async_add_plug(EventType.RESOURCE_ADDED, light)
+    config_entry.async_on_unload(
+        lights.subscribe(async_add_plug, event_filter=EventType.RESOURCE_ADDED)
+    )
+    config_entry.async_on_unload(
+        api.devices.subscribe(
+            async_retry_plugs,
+            event_filter=(EventType.RESOURCE_ADDED, EventType.RESOURCE_UPDATED),
+        )
+    )
+
+
+class HueSmartPlug(HueBaseEntity, SwitchEntity):
+    """Represent a Hue smart plug configured as an outlet switch."""
+
+    controller: LightsController
+    resource: Light
+    _attr_device_class = SwitchDeviceClass.OUTLET
+    _attr_has_entity_name = True
+    _attr_name = None
+
+    @property
+    @override
+    def is_on(self) -> bool:
+        """Return whether the plug is on."""
+        return self.resource.on.on
+
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the plug on."""
+        await self.bridge.async_request_call(
+            self.controller.set_state, self.resource.id, on=True
+        )
+
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the plug off."""
+        await self.bridge.async_request_call(
+            self.controller.set_state, self.resource.id, on=False
+        )
 
 
 class HueResourceEnabledEntity(HueBaseEntity, SwitchEntity):

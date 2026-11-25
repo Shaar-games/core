@@ -1,12 +1,25 @@
 """Helper functions for Philips Hue v2."""
 
+from typing import TYPE_CHECKING
+
 from aiohue.v2 import HueBridgeV2
+from aiohue.v2.models.light import Light
 from aiohue.v2.models.motion_area_configuration import MotionAreaConfiguration
 
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.util import color as color_util
 
-from ..const import DOMAIN
+from ..const import CONF_SMART_PLUGS_AS_SWITCHES, DOMAIN
+
+if TYPE_CHECKING:
+    from ..bridge import HueConfigEntry
+
+
+def is_configured_as_switch(resource: Light, config_entry: HueConfigEntry) -> bool:
+    """Return whether the owner of this Hue light is configured as a switch."""
+    return resource.owner.rid in config_entry.options.get(
+        CONF_SMART_PLUGS_AS_SWITCHES, ()
+    )
 
 
 def normalize_hue_brightness(brightness: float | None) -> float | None:

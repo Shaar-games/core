@@ -21,16 +21,18 @@ from homeassistant.components.light import (
     LightEntityDescription,
     LightEntityFeature,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import color as color_util
 
 from ..bridge import HueBridge, HueConfigEntry
-from ..const import DOMAIN
+from ..const import CONF_SMART_PLUGS_AS_SWITCHES, DOMAIN
 from .entity import HueBaseEntity
 from .helpers import (
+    is_configured_as_switch,
     normalize_hue_brightness,
     normalize_hue_colortemp,
     normalize_hue_transition,
@@ -131,6 +133,32 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             self.async_on_remove(
                 self.api.lights.subscribe(self._handle_event, light_ids)
             )
+        if self.bridge.config_entry.options.get(CONF_SMART_PLUGS_AS_SWITCHES):
+            self.async_on_remove(
+                self.hass.bus.async_listen(
+                    er.EVENT_ENTITY_REGISTRY_UPDATED,
+                    self._async_handle_switch_registry_update,
+                )
+            )
+
+    @callback
+    def _async_handle_switch_registry_update(
+        self, event: Event[er.EventEntityRegistryUpdatedData]
+    ) -> None:
+        """Refresh member IDs when a plug's switch entity is registered or renamed."""
+        entity_id = event.data["entity_id"]
+        if not entity_id.startswith("switch."):
+            return
+        entry = er.async_get(self.hass).async_get(entity_id)
+        if entry is None or (
+            entry.platform == DOMAIN
+            and entry.config_entry_id == self.bridge.config_entry.entry_id
+            and any(
+                light.id == entry.unique_id
+                for light in self.controller.get_lights(self.resource.id)
+            )
+        ):
+            self.async_write_ha_state()
 
     @property
     @override
@@ -145,12 +173,7 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
         scenes = {
             x.metadata.name for x in self.api.scenes if x.group.rid == self.hue_group.id
         }
-        light_resource_ids = tuple(
-            x.id for x in self.controller.get_lights(self.resource.id)
-        )
-        light_names, light_entities = self._get_names_and_entity_ids_for_resource_ids(
-            light_resource_ids
-        )
+        light_names, light_entities = self._get_names_and_entity_ids()
         return {
             "is_hue_group": True,
             "hue_scenes": scenes,
@@ -363,17 +386,18 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             self._attr_color_mode = ColorMode.ONOFF
 
     @callback
-    def _get_names_and_entity_ids_for_resource_ids(
-        self, resource_ids: tuple[str]
-    ) -> tuple[set[str], set[str]]:
-        """Return the names and entity ids for the given Hue (light) resource IDs."""
+    def _get_names_and_entity_ids(self) -> tuple[set[str], set[str]]:
+        """Return the names and entity IDs of the group's Hue light resources."""
         ent_reg = er.async_get(self.hass)
         light_names: set[str] = set()
         light_entities: set[str] = set()
-        for resource_id in resource_ids:
-            light_names.add(self.controller.get_device(resource_id).metadata.name)
-            if entity_id := ent_reg.async_get_entity_id(
-                self.platform.domain, DOMAIN, resource_id
-            ):
+        for light in self.controller.get_lights(self.resource.id):
+            light_names.add(self.controller.get_device(light.id).metadata.name)
+            domain = (
+                Platform.SWITCH
+                if is_configured_as_switch(light, self.bridge.config_entry)
+                else Platform.LIGHT
+            )
+            if entity_id := ent_reg.async_get_entity_id(domain, DOMAIN, light.id):
                 light_entities.add(entity_id)
         return light_names, light_entities

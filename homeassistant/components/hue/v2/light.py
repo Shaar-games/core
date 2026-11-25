@@ -33,6 +33,7 @@ from ..bridge import HueBridge, HueConfigEntry
 from .entity import HueBaseEntity
 from .helpers import (
     hue_brightness_to_ha,
+    is_configured_as_switch,
     normalize_hue_brightness,
     normalize_hue_colortemp,
     normalize_hue_transition,
@@ -72,6 +73,8 @@ async def async_setup_entry(
 
     def make_light_entities(resource: Light) -> list[HueBaseEntity]:
         """Create the light entity plus a segment entity per gradient point."""
+        if is_configured_as_switch(resource, config_entry):
+            return []
         entities: list[HueBaseEntity] = [HueLight(bridge, controller, resource)]
         if resource.gradient is not None:
             writer = HueGradientWriter(bridge, controller, resource)
