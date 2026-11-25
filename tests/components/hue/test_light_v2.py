@@ -881,6 +881,36 @@ async def test_gradient_light_added(hass: HomeAssistant, mock_bridge_v2: Mock) -
     assert segment_3.attributes["xy_color"] == (0.3127, 0.329)
 
 
+async def test_gradient_light_uses_reannounced_points(
+    hass: HomeAssistant, mock_bridge_v2: Mock
+) -> None:
+    """Use the new bridge resource when writing one gradient segment."""
+    await mock_bridge_v2.api.load_test_data([FAKE_DEVICE, FAKE_GRADIENT_LIGHT])
+    await setup_platform(hass, mock_bridge_v2, Platform.LIGHT)
+
+    updated_points = [(0.15, 0.25), (0.35, 0.45), (0.5, 0.3)]
+    mock_bridge_v2.api.emit_event(
+        "add",
+        {
+            **FAKE_GRADIENT_LIGHT,
+            "gradient": {**gradient_json(updated_points), "points_capable": 3},
+        },
+    )
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        "light",
+        "turn_on",
+        {"entity_id": "light.hue_mocked_device_segment_1", "xy_color": (0.2, 0.2)},
+        blocking=True,
+    )
+    request = mock_bridge_v2.mock_requests.pop()
+    assert (
+        request["json"]["gradient"]["points"]
+        == gradient_json([(0.2, 0.2), *updated_points[1:]])["points"]
+    )
+
+
 async def test_light_added(hass: HomeAssistant, mock_bridge_v2: Mock) -> None:
     """Test new light added to bridge."""
     await mock_bridge_v2.api.load_test_data([FAKE_DEVICE, FAKE_ZIGBEE_CONNECTIVITY])

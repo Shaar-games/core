@@ -8,19 +8,196 @@ from aiohue.v2.models.device import DeviceArchetypes
 from aiohue.v2.models.resource import ResourceTypes
 
 from homeassistant import core
+from homeassistant.components.automation import automations_with_entity
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.script import scripts_with_entity
 from homeassistant.components.sensor import SensorDeviceClass
-from homeassistant.const import CONF_API_KEY, CONF_API_VERSION, CONF_HOST, CONF_USERNAME
+from homeassistant.const import (
+    CONF_API_KEY,
+    CONF_API_VERSION,
+    CONF_HOST,
+    CONF_USERNAME,
+    Platform,
+)
 from homeassistant.helpers import (
     aiohttp_client,
     device_registry as dr,
     entity_registry as er,
+    issue_registry as ir,
 )
+from homeassistant.helpers.event import async_track_entity_registry_updated_event
+from homeassistant.helpers.start import async_at_started
 
 from .bridge import HueConfigEntry
-from .const import DOMAIN
+from .const import DOMAIN, SMART_PLUG_LIGHT_ISSUE_PREFIX
 
 LOGGER = logging.getLogger(__name__)
+
+SMART_PLUG_LIGHT_REMOVAL_VERSION = "2027.7.0"
+SMART_PLUG_LIGHT_SETTINGS_MIGRATED = "legacy_light_settings_migrated"
+
+
+@core.callback
+def async_prepare_smart_plug(
+    hass: core.HomeAssistant,
+    entry: HueConfigEntry,
+    unique_id: str,
+    device_name: str,
+) -> None:
+    """Prepare the outlet switch and deprecate any existing light entity."""
+    registry = er.async_get(hass)
+    issue_id = f"{SMART_PLUG_LIGHT_ISSUE_PREFIX}{entry.entry_id}_{unique_id}"
+    if (
+        (light_id := registry.async_get_entity_id(Platform.LIGHT, DOMAIN, unique_id))
+        is None
+        or (light := registry.async_get(light_id)) is None
+        or light.config_entry_id != entry.entry_id
+    ):
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+
+    ir.async_keep_issue(hass, DOMAIN, issue_id)
+    switch_id = registry.async_get_entity_id(Platform.SWITCH, DOMAIN, unique_id)
+    if switch_id is None:
+        replacement = registry.async_get_or_create(
+            Platform.SWITCH,
+            DOMAIN,
+            unique_id,
+            suggested_object_id=core.split_entity_id(light_id)[1],
+            config_entry=entry,
+            device_id=light.device_id,
+            disabled_by=light.disabled_by,
+            hidden_by=light.hidden_by,
+            get_initial_options=lambda: {
+                domain: dict(options)
+                for domain, options in light.options.items()
+                if domain != Platform.LIGHT
+            },
+        )
+        switch_id = replacement.entity_id
+        # The registry requires an entity name when it has its own area.
+        name = light.name
+        if name is None and light.area_id is not None:
+            name = device_name or core.split_entity_id(light_id)[1]
+        registry.async_update_entity(
+            switch_id,
+            aliases=light.aliases,
+            area_id=light.area_id,
+            categories=light.categories,
+            icon=light.icon,
+            labels=light.labels,
+            name=name,
+        )
+    if (switch := registry.async_get(switch_id)) is not None and (
+        SMART_PLUG_LIGHT_SETTINGS_MIGRATED not in switch.options.get(DOMAIN, {})
+    ):
+        derived_disablers = (
+            er.RegistryEntryDisabler.CONFIG_ENTRY,
+            er.RegistryEntryDisabler.DEVICE,
+        )
+        if light.disabled and (
+            not switch.disabled
+            or (
+                light.disabled_by not in derived_disablers
+                and switch.disabled_by in derived_disablers
+            )
+        ):
+            registry.async_update_entity(switch_id, disabled_by=light.disabled_by)
+        for domain, options in light.options.items():
+            if options.get("should_expose") is False:
+                registry.async_update_entity_options(
+                    switch_id,
+                    domain,
+                    {**switch.options.get(domain, {}), "should_expose": False},
+                )
+        registry.async_update_entity_options(
+            switch_id,
+            DOMAIN,
+            {
+                **switch.options.get(DOMAIN, {}),
+                SMART_PLUG_LIGHT_SETTINGS_MIGRATED: True,
+            },
+        )
+
+    @core.callback
+    def async_refresh_deprecation_issue(hass: core.HomeAssistant) -> None:
+        current_light = registry.async_get_entity_id(Platform.LIGHT, DOMAIN, unique_id)
+        current_switch = registry.async_get_entity_id(
+            Platform.SWITCH, DOMAIN, unique_id
+        )
+        if current_light is None or current_switch is None:
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+            return
+        references = sorted(
+            set(automations_with_entity(hass, current_light))
+            | set(scripts_with_entity(hass, current_light))
+        )
+        if (
+            (legacy := registry.async_get(current_light)) is not None
+            and legacy.disabled
+            and not references
+        ):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+            return
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            breaks_in_ha_version=SMART_PLUG_LIGHT_REMOVAL_VERSION,
+            config_entry_id=entry.entry_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="deprecated_smart_plug_light_used"
+            if references
+            else "deprecated_smart_plug_light",
+            translation_placeholders={
+                "light": current_light,
+                "switch": current_switch,
+                **(
+                    {"items": "\n".join(f"- `{item}`" for item in references)}
+                    if references
+                    else {}
+                ),
+            },
+        )
+
+    unsubscribe: core.CALLBACK_TYPE = core.async_noop
+
+    @core.callback
+    def async_watch_entities() -> core.CALLBACK_TYPE:
+        entity_ids = tuple(
+            entity_id
+            for platform in (Platform.LIGHT, Platform.SWITCH)
+            if (entity_id := registry.async_get_entity_id(platform, DOMAIN, unique_id))
+            is not None
+        )
+        return async_track_entity_registry_updated_event(
+            hass, entity_ids, async_handle_registry_event
+        )
+
+    @core.callback
+    def async_handle_registry_event(
+        event: core.Event[er.EventEntityRegistryUpdatedData],
+    ) -> None:
+        nonlocal unsubscribe
+        data = event.data
+        if data["action"] == "update":
+            if "old_entity_id" in data:
+                unsubscribe()
+                unsubscribe = async_watch_entities()
+            elif "disabled_by" not in data["changes"]:
+                return
+        if hass.is_running:
+            async_refresh_deprecation_issue(hass)
+
+    @core.callback
+    def async_stop_watching() -> None:
+        unsubscribe()
+
+    unsubscribe = async_watch_entities()
+    entry.async_on_unload(async_stop_watching)
+    entry.async_on_unload(async_at_started(hass, async_refresh_deprecation_issue))
 
 
 async def check_migration(hass: core.HomeAssistant, entry: HueConfigEntry) -> None:

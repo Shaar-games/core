@@ -21,7 +21,7 @@ from homeassistant.components.light import (
     LightEntityDescription,
     LightEntityFeature,
 )
-from homeassistant.const import Platform
+from homeassistant.const import ATTR_ENTITY_ID, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -29,15 +29,21 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import color as color_util
 
 from ..bridge import HueBridge, HueConfigEntry
-from ..const import CONF_SMART_PLUGS_AS_SWITCHES, DOMAIN
+from ..const import DOMAIN
 from .entity import HueBaseEntity
 from .helpers import (
-    is_configured_as_switch,
+    is_smart_plug,
     normalize_hue_brightness,
     normalize_hue_colortemp,
     normalize_hue_transition,
 )
 from .light import FALLBACK_MAX_MIREDS, FALLBACK_MIN_MIREDS
+
+
+@callback
+def _is_member_registry_event(data: er.EventEntityRegistryUpdatedData) -> bool:
+    """Return whether the registry event concerns a light or outlet."""
+    return data["entity_id"].startswith(("light.", "switch."))
 
 
 async def async_setup_entry(
@@ -133,24 +139,28 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             self.async_on_remove(
                 self.api.lights.subscribe(self._handle_event, light_ids)
             )
-        if self.bridge.config_entry.options.get(CONF_SMART_PLUGS_AS_SWITCHES):
-            self.async_on_remove(
-                self.hass.bus.async_listen(
-                    er.EVENT_ENTITY_REGISTRY_UPDATED,
-                    self._async_handle_switch_registry_update,
-                )
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                er.EVENT_ENTITY_REGISTRY_UPDATED,
+                self._async_handle_member_registry_update,
+                event_filter=_is_member_registry_event,
             )
+        )
 
     @callback
-    def _async_handle_switch_registry_update(
+    def _async_handle_member_registry_update(
         self, event: Event[er.EventEntityRegistryUpdatedData]
     ) -> None:
-        """Refresh member IDs when a plug's switch entity is registered or renamed."""
+        """Refresh member IDs when an entity in this group changes."""
         entity_id = event.data["entity_id"]
-        if not entity_id.startswith("switch."):
+        if (entry := er.async_get(self.hass).async_get(entity_id)) is None:
+            if (state := self.hass.states.get(self.entity_id)) and (
+                entity_id in state.attributes.get(ATTR_ENTITY_ID, ())
+            ):
+                self.async_write_ha_state()
             return
-        entry = er.async_get(self.hass).async_get(entity_id)
-        if entry is None or (
+
+        if (
             entry.platform == DOMAIN
             and entry.config_entry_id == self.bridge.config_entry.entry_id
             and any(
@@ -179,7 +189,7 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
             "hue_scenes": scenes,
             "hue_type": self.hue_group.type.value,
             "lights": light_names,
-            "entity_id": light_entities,
+            ATTR_ENTITY_ID: light_entities,
             "dynamics": self._dynamic_mode_active,
         }
 
@@ -392,12 +402,18 @@ class GroupedHueLight(HueBaseEntity, LightEntity):
         light_names: set[str] = set()
         light_entities: set[str] = set()
         for light in self.controller.get_lights(self.resource.id):
-            light_names.add(self.controller.get_device(light.id).metadata.name)
-            domain = (
-                Platform.SWITCH
-                if is_configured_as_switch(light, self.bridge.config_entry)
-                else Platform.LIGHT
-            )
-            if entity_id := ent_reg.async_get_entity_id(domain, DOMAIN, light.id):
+            if (device := self.controller.get_device(light.id)) is None:
+                continue
+            light_names.add(device.metadata.name)
+            entity_id = ent_reg.async_get_entity_id(Platform.LIGHT, DOMAIN, light.id)
+            if is_smart_plug(device) and (
+                entity_id is None
+                or (legacy := ent_reg.async_get(entity_id)) is None
+                or legacy.disabled
+            ):
+                entity_id = ent_reg.async_get_entity_id(
+                    Platform.SWITCH, DOMAIN, light.id
+                )
+            if entity_id is not None:
                 light_entities.add(entity_id)
         return light_names, light_entities

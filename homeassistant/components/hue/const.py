@@ -11,7 +11,7 @@ from aiohue.v2.models.relative_rotary import (
 DOMAIN = "hue"
 
 CONF_IGNORE_AVAILABILITY = "ignore_availability"
-CONF_SMART_PLUGS_AS_SWITCHES = "smart_plugs_as_switches"
+SMART_PLUG_LIGHT_ISSUE_PREFIX = "deprecated_smart_plug_light_"
 
 CONF_SUBTYPE = "subtype"
 

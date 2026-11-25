@@ -6,15 +6,16 @@ import pytest
 from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.hue import bridge
-from homeassistant.components.hue.const import (
-    CONF_IGNORE_AVAILABILITY,
-    CONF_SMART_PLUGS_AS_SWITCHES,
-    DOMAIN,
-)
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, Platform
+from homeassistant.components.hue.const import DOMAIN
+from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
+from homeassistant.const import STATE_OFF, STATE_ON, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    entity_registry as er,
+    issue_registry as ir,
+)
 from homeassistant.setup import async_setup_component
 from homeassistant.util.json import JsonArrayType
 
@@ -37,6 +38,7 @@ MOTION_AREA_CONFIGURATION_ID = "5e6f7a8b-9c1d-4e2f-b3a4-5c6d7e8f9a0b"
 SMART_PLUG_DEVICE_ID = "smart_plug_device"
 SMART_PLUG_LIGHT_ID = "smart_plug_light"
 SMART_PLUG_SWITCH = "switch.hue_smart_plug"
+SMART_PLUG_LEGACY_LIGHT = "light.hue_smart_plug"
 SMART_PLUG_DEVICE = {
     **FAKE_DEVICE,
     "id": SMART_PLUG_DEVICE_ID,
@@ -56,79 +58,249 @@ SMART_PLUG_LIGHT = {
 }
 
 
-async def test_smart_plug_option(
+@pytest.mark.parametrize(
+    ("manufacturer", "model_id", "archetype"),
+    [
+        pytest.param("Signify Netherlands B.V.", "LOM010", "plug", id="hue"),
+        pytest.param("innr", "SP 222", "classic_bulb", id="innr"),
+    ],
+)
+async def test_smart_plug(
     hass: HomeAssistant,
     mock_api_v2: Mock,
     mock_config_entry_v2: MockConfigEntry,
     entity_registry: er.EntityRegistry,
+    manufacturer: str,
+    model_id: str,
+    archetype: str,
 ) -> None:
-    """Test switching a smart plug between its default light and outlet entity."""
+    """Test automatic outlet registration and switching on the bridge."""
     await mock_api_v2.load_test_data(
-        [FAKE_DEVICE, FAKE_LIGHT, SMART_PLUG_DEVICE, SMART_PLUG_LIGHT]
+        [
+            FAKE_DEVICE,
+            FAKE_LIGHT,
+            {
+                **SMART_PLUG_DEVICE,
+                "product_data": {
+                    **SMART_PLUG_DEVICE["product_data"],
+                    "manufacturer_name": manufacturer,
+                    "model_id": model_id,
+                    "product_archetype": archetype,
+                },
+            },
+            SMART_PLUG_LIGHT,
+        ]
     )
-    entry = mock_config_entry_v2
-    entry.add_to_hass(hass)
+    mock_config_entry_v2.add_to_hass(hass)
 
     with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
         assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()
 
-        light_id = "light.hue_smart_plug"
-        switch_id = SMART_PLUG_SWITCH
-        assert hass.states.is_state(light_id, STATE_OFF)
-        assert hass.states.get(switch_id) is None
+    assert entity_registry.async_get(SMART_PLUG_LEGACY_LIGHT) is None
+    assert hass.states.get(SMART_PLUG_LEGACY_LIGHT) is None
+    assert hass.states.is_state(SMART_PLUG_SWITCH, STATE_OFF)
+    assert hass.states.get(SMART_PLUG_SWITCH).attributes["device_class"] == "outlet"
+    assert hass.states.is_state("light.hue_mocked_device", STATE_OFF)
+    assert not mock_api_v2.mock_requests
 
-        result = await hass.config_entries.options.async_init(entry.entry_id)
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            user_input={
-                CONF_IGNORE_AVAILABILITY: [],
-                CONF_SMART_PLUGS_AS_SWITCHES: [SMART_PLUG_DEVICE_ID],
-            },
+    for service, on, state in (
+        ("turn_on", True, STATE_ON),
+        ("turn_off", False, STATE_OFF),
+    ):
+        await hass.services.async_call(
+            SWITCH_DOMAIN, service, {"entity_id": SMART_PLUG_SWITCH}, blocking=True
         )
-        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert mock_api_v2.mock_requests.pop() == {
+            "method": "put",
+            "path": f"clip/v2/resource/light/{SMART_PLUG_LIGHT_ID}",
+            "json": {"on": {"on": on}},
+        }
+        mock_api_v2.emit_event(
+            "update", {"id": SMART_PLUG_LIGHT_ID, "type": "light", "on": {"on": on}}
+        )
+        await hass.async_block_till_done()
+        assert hass.states.is_state(SMART_PLUG_SWITCH, state)
+
+
+@pytest.mark.parametrize(
+    ("disabled_by", "legacy_name", "expected_state", "expected_name"),
+    [
+        pytest.param(
+            None, "Computer outlet", STATE_OFF, "Computer outlet", id="enabled"
+        ),
+        pytest.param(None, None, STATE_OFF, "Hue Smart Plug", id="unnamed_with_area"),
+        pytest.param(
+            er.RegistryEntryDisabler.USER,
+            "Computer outlet",
+            None,
+            "Computer outlet",
+            id="disabled",
+        ),
+    ],
+)
+async def test_smart_plug_migration(
+    hass: HomeAssistant,
+    mock_api_v2: Mock,
+    mock_config_entry_v2: MockConfigEntry,
+    area_registry: ar.AreaRegistry,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    issue_registry: ir.IssueRegistry,
+    disabled_by: er.RegistryEntryDisabler | None,
+    legacy_name: str | None,
+    expected_state: str | None,
+    expected_name: str,
+) -> None:
+    """Move user settings from the previous light entity to the outlet."""
+    await mock_api_v2.load_test_data([SMART_PLUG_DEVICE, SMART_PLUG_LIGHT])
+    mock_config_entry_v2.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=mock_config_entry_v2.entry_id,
+        identifiers={(DOMAIN, SMART_PLUG_DEVICE_ID)},
+    )
+    area = area_registry.async_create("Office")
+    legacy = entity_registry.async_get_or_create(
+        Platform.LIGHT,
+        DOMAIN,
+        SMART_PLUG_LIGHT_ID,
+        config_entry=mock_config_entry_v2,
+        device_id=device.id,
+        suggested_object_id="computer_outlet",
+        disabled_by=disabled_by,
+        hidden_by=er.RegistryEntryHider.USER,
+        has_entity_name=True,
+        original_name="Legacy light",
+    )
+    entity_registry.async_update_entity(
+        legacy.entity_id, name=legacy_name, area_id=area.id, icon="mdi:power-plug"
+    )
+    entity_registry.async_get_or_create(
+        Platform.LIGHT,
+        DOMAIN,
+        SMART_PLUG_LIGHT_ID,
+        config_entry=mock_config_entry_v2,
+        has_entity_name=True,
+        original_name=None,
+    )
+    entity_registry.async_update_entity_options(
+        legacy.entity_id, "conversation", {"should_expose": False}
+    )
+
+    with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
+        assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()
 
-        assert hass.states.is_state(light_id, STATE_UNAVAILABLE)
-        assert hass.states.is_state(switch_id, STATE_OFF)
-        assert hass.states.get(switch_id).attributes["device_class"] == "outlet"
-        assert hass.states.is_state("light.hue_mocked_device", STATE_OFF)
-        assert (
-            entity_registry.async_get(switch_id).device_id
-            == entity_registry.async_get(light_id).device_id
-        )
+    assert getattr(hass.states.get(legacy.entity_id), "state", None) == expected_state
+    issue_id = f"deprecated_smart_plug_light_{mock_config_entry_v2.entry_id}_{SMART_PLUG_LIGHT_ID}"
+    assert bool(issue_registry.async_get_issue(DOMAIN, issue_id)) == (
+        expected_state is not None
+    )
+    replacement = entity_registry.async_get("switch.computer_outlet")
+    assert replacement is not None
+    assert replacement.device_id == device.id
+    assert replacement.name == expected_name
+    assert replacement.area_id == area.id
+    assert replacement.icon == "mdi:power-plug"
+    assert replacement.disabled_by == disabled_by
+    assert replacement.hidden_by is er.RegistryEntryHider.USER
+    assert replacement.options["conversation"] == {"should_expose": False}
+    assert (
+        getattr(hass.states.get(replacement.entity_id), "state", None) == expected_state
+    )
+    assert not mock_api_v2.mock_requests
 
-        for service, on, state in (
-            ("turn_on", True, STATE_ON),
-            ("turn_off", False, STATE_OFF),
-        ):
-            await hass.services.async_call(
-                "switch", service, {"entity_id": switch_id}, blocking=True
-            )
-            assert mock_api_v2.mock_requests.pop() == {
-                "method": "put",
-                "path": f"clip/v2/resource/light/{SMART_PLUG_LIGHT_ID}",
-                "json": {"on": {"on": on}},
-            }
-            mock_api_v2.emit_event(
-                "update", {"id": SMART_PLUG_LIGHT_ID, "type": "light", "on": {"on": on}}
-            )
-            await hass.async_block_till_done()
-            assert hass.states.is_state(switch_id, state)
 
-        result = await hass.config_entries.options.async_init(entry.entry_id)
-        result = await hass.config_entries.options.async_configure(
-            result["flow_id"],
-            user_input={
-                CONF_IGNORE_AVAILABILITY: [],
-                CONF_SMART_PLUGS_AS_SWITCHES: [],
-            },
-        )
-        assert result["type"] is FlowResultType.CREATE_ENTRY
+async def test_smart_plug_repair_follows_entity_changes(
+    hass: HomeAssistant,
+    mock_api_v2: Mock,
+    mock_config_entry_v2: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Update the repair after a rename and clear it after disabling the light."""
+    await mock_api_v2.load_test_data([SMART_PLUG_DEVICE, SMART_PLUG_LIGHT])
+    mock_config_entry_v2.add_to_hass(hass)
+    legacy = entity_registry.async_get_or_create(
+        Platform.LIGHT,
+        DOMAIN,
+        SMART_PLUG_LIGHT_ID,
+        config_entry=mock_config_entry_v2,
+        suggested_object_id="hue_smart_plug",
+    )
+    with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
+        assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()
 
-        assert hass.states.is_state(light_id, STATE_OFF)
-        assert hass.states.is_state(switch_id, STATE_UNAVAILABLE)
+    issue_id = f"deprecated_smart_plug_light_{mock_config_entry_v2.entry_id}_{SMART_PLUG_LIGHT_ID}"
+    issue = issue_registry.async_get_issue(DOMAIN, issue_id)
+    assert issue is not None
+    assert issue.breaks_in_ha_version == "2027.7.0"
+    assert issue.translation_placeholders == {
+        "light": legacy.entity_id,
+        "switch": SMART_PLUG_SWITCH,
+    }
+
+    entity_registry.async_update_entity(
+        legacy.entity_id, new_entity_id="light.old_outlet"
+    )
+    await hass.async_block_till_done()
+    assert (
+        issue_registry.async_get_issue(DOMAIN, issue_id).translation_placeholders[
+            "light"
+        ]
+        == "light.old_outlet"
+    )
+
+    entity_registry.async_update_entity(
+        "light.old_outlet", disabled_by=er.RegistryEntryDisabler.USER
+    )
+    await hass.async_block_till_done()
+    assert issue_registry.async_get_issue(DOMAIN, issue_id) is None
+    assert hass.states.get("light.old_outlet") is None
+    assert hass.states.is_state(SMART_PLUG_SWITCH, STATE_OFF)
+    assert not mock_api_v2.mock_requests
+
+
+async def test_existing_smart_plug_switch_respects_legacy_preferences(
+    hass: HomeAssistant,
+    mock_api_v2: Mock,
+    mock_config_entry_v2: MockConfigEntry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Preserve restrictions saved on a light when its switch already exists."""
+    await mock_api_v2.load_test_data([SMART_PLUG_DEVICE, SMART_PLUG_LIGHT])
+    mock_config_entry_v2.add_to_hass(hass)
+    legacy = entity_registry.async_get_or_create(
+        Platform.LIGHT,
+        DOMAIN,
+        SMART_PLUG_LIGHT_ID,
+        config_entry=mock_config_entry_v2,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    replacement = entity_registry.async_get_or_create(
+        Platform.SWITCH,
+        DOMAIN,
+        SMART_PLUG_LIGHT_ID,
+        config_entry=mock_config_entry_v2,
+    )
+    entity_registry.async_update_entity_options(
+        legacy.entity_id, "conversation", {"should_expose": False}
+    )
+    entity_registry.async_update_entity_options(
+        replacement.entity_id, "conversation", {"should_expose": True}
+    )
+
+    with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
+        assert await async_setup_component(hass, DOMAIN, {})
+        await hass.async_block_till_done()
+
+    switch = entity_registry.async_get(replacement.entity_id)
+    assert switch is not None
+    assert switch.disabled_by is er.RegistryEntryDisabler.USER
+    assert switch.options["conversation"]["should_expose"] is False
+    assert hass.states.get(replacement.entity_id) is None
+    assert not mock_api_v2.mock_requests
 
 
 async def test_smart_plug_light_arrives_before_device(
@@ -141,10 +313,6 @@ async def test_smart_plug_light_arrives_before_device(
     """Wait for the plug device to advertise its light before creating the switch."""
     await mock_api_v2.load_test_data([])
     mock_config_entry_v2.add_to_hass(hass)
-    hass.config_entries.async_update_entry(
-        mock_config_entry_v2,
-        options={CONF_SMART_PLUGS_AS_SWITCHES: [SMART_PLUG_DEVICE_ID]},
-    )
     with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
         assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()
@@ -152,7 +320,7 @@ async def test_smart_plug_light_arrives_before_device(
     mock_api_v2.emit_event("add", SMART_PLUG_LIGHT)
     await hass.async_block_till_done()
     assert hass.states.get(SMART_PLUG_SWITCH) is None
-    assert hass.states.get("light.hue_smart_plug") is None
+    assert hass.states.get(SMART_PLUG_LEGACY_LIGHT) is None
 
     mock_api_v2.emit_event("add", {**SMART_PLUG_DEVICE, "services": []})
     await hass.async_block_till_done()
@@ -166,6 +334,13 @@ async def test_smart_plug_light_arrives_before_device(
     )
     assert device is not None
     assert entity_registry.async_get(SMART_PLUG_SWITCH).device_id == device.id
+
+    mock_api_v2.emit_event("add", SMART_PLUG_LIGHT)
+    mock_api_v2.emit_event(
+        "update", {"id": SMART_PLUG_LIGHT_ID, "type": "light", "on": {"on": True}}
+    )
+    await hass.async_block_till_done()
+    assert hass.states.is_state(SMART_PLUG_SWITCH, STATE_ON)
 
 
 async def test_hue_room_reports_smart_plug_switch(
@@ -203,10 +378,6 @@ async def test_hue_room_reports_smart_plug_switch(
         ]
     )
     mock_config_entry_v2.add_to_hass(hass)
-    hass.config_entries.async_update_entry(
-        mock_config_entry_v2,
-        options={CONF_SMART_PLUGS_AS_SWITCHES: [SMART_PLUG_DEVICE_ID]},
-    )
     with patch.object(bridge, "HueBridgeV2", return_value=mock_api_v2):
         assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()

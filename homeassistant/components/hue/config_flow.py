@@ -10,17 +10,10 @@ from aiohue.discovery import DiscoveredHueBridge, discover_bridge, discover_nupn
 from aiohue.errors import AiohueException
 from aiohue.util import normalize_bridge_id
 from aiohue.v2 import HueBridgeV2
-from aiohue.v2.models.device import DeviceArchetypes
-from aiohue.v2.models.resource import ResourceTypes
 import probatio
 import slugify as unicode_slug
 
-from homeassistant.config_entries import (
-    ConfigEntryState,
-    ConfigFlow,
-    ConfigFlowResult,
-    OptionsFlow,
-)
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_API_KEY, CONF_API_VERSION, CONF_HOST
 from homeassistant.core import callback
 from homeassistant.helpers import (
@@ -35,7 +28,6 @@ from .const import (
     CONF_ALLOW_HUE_GROUPS,
     CONF_ALLOW_UNREACHABLE,
     CONF_IGNORE_AVAILABILITY,
-    CONF_SMART_PLUGS_AS_SWITCHES,
     DEFAULT_ALLOW_HUE_GROUPS,
     DEFAULT_ALLOW_UNREACHABLE,
     DOMAIN,
@@ -417,35 +409,14 @@ class HueV2OptionsFlowHandler(OptionsFlow):
             if item in dev_ids
         ]
 
-        selected = self.config_entry.options.get(CONF_SMART_PLUGS_AS_SWITCHES, [])
-        plugs = {
-            device_id: dev_ids.get(device_id) or device_id for device_id in selected
-        }
-        if self.config_entry.state is ConfigEntryState.LOADED:
-            api: HueBridgeV2 = self.config_entry.runtime_data.api
-            plugs.update(
-                {
-                    device.id: dev_ids.get(device.id) or device.metadata.name
-                    for device in api.devices
-                    if device.product_data.product_archetype is DeviceArchetypes.PLUG
-                    and any(
-                        service.rtype is ResourceTypes.LIGHT
-                        for service in device.services
-                    )
-                }
-            )
-
-        schema = {
-            probatio.Optional(
-                CONF_IGNORE_AVAILABILITY, default=cur_ids
-            ): cv.multi_select(dev_ids),
-        }
-        if plugs:
-            schema[
-                probatio.Optional(CONF_SMART_PLUGS_AS_SWITCHES, default=selected)
-            ] = cv.multi_select(plugs)
-
         return self.async_show_form(
             step_id="init",
-            data_schema=probatio.Schema(schema),
+            data_schema=probatio.Schema(
+                {
+                    probatio.Optional(
+                        CONF_IGNORE_AVAILABILITY,
+                        default=cur_ids,
+                    ): cv.multi_select(dev_ids),
+                }
+            ),
         )

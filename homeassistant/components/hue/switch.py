@@ -30,13 +30,18 @@ from homeassistant.components.switch import (
 )
 from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import entity_registry as er, issue_registry as ir
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .bridge import HueBridge, HueConfigEntry
-from .const import CONF_SMART_PLUGS_AS_SWITCHES, DOMAIN
+from .const import DOMAIN, SMART_PLUG_LIGHT_ISSUE_PREFIX
+from .migration import async_prepare_smart_plug
 from .v2.entity import HueBaseEntity
-from .v2.helpers import get_motion_area_device_info, is_configured_as_switch
+from .v2.helpers import (
+    async_subscribe_lights,
+    get_motion_area_device_info,
+    is_smart_plug,
+)
 
 
 async def async_setup_entry(
@@ -122,51 +127,31 @@ async def async_setup_entry(
     register_items(
         api.config.motion_area_configuration, HueMotionAreaConfigurationEnabledEntity
     )
-    if config_entry.options.get(CONF_SMART_PLUGS_AS_SWITCHES):
-        _async_register_smart_plugs(bridge, api, async_add_entities)
-
-
-@callback
-def _async_register_smart_plugs(
-    bridge: HueBridge,
-    api: HueBridgeV2,
-    async_add_entities: AddConfigEntryEntitiesCallback,
-) -> None:
-    """Register opted-in plug resources as switches."""
-    config_entry = bridge.config_entry
-    lights = api.lights
-    pending: dict[str, set[str]] = {}
 
     @callback
-    def async_add_plug(event_type: EventType, light: Light) -> None:
-        if not is_configured_as_switch(light, config_entry):
-            return
-        if lights.get_device(light.id) is None:
-            pending.setdefault(light.owner.rid, set()).add(light.id)
-            return
-        async_add_entities([HueSmartPlug(bridge, lights, light)])
+    def async_add_plug(resource: Light, device: Device) -> None:
+        """Add smart plugs as outlet switches."""
+        if is_smart_plug(device):
+            async_prepare_smart_plug(
+                hass, config_entry, resource.id, device.metadata.name
+            )
+            async_add_entities([HueSmartPlug(bridge, api.lights, resource)])
 
-    @callback
-    def async_retry_plugs(event_type: EventType, device: Device) -> None:
-        for light_id in pending.pop(device.id, set()):
-            if (light := lights.get(light_id)) is not None:
-                async_add_plug(event_type, light)
-
-    for light in lights:
-        async_add_plug(EventType.RESOURCE_ADDED, light)
-    config_entry.async_on_unload(
-        lights.subscribe(async_add_plug, event_filter=EventType.RESOURCE_ADDED)
-    )
-    config_entry.async_on_unload(
-        api.devices.subscribe(
-            async_retry_plugs,
-            event_filter=(EventType.RESOURCE_ADDED, EventType.RESOURCE_UPDATED),
-        )
-    )
+    issue_prefix = f"{SMART_PLUG_LIGHT_ISSUE_PREFIX}{config_entry.entry_id}_"
+    with ir.async_refresh_issues(
+        hass,
+        DOMAIN,
+        config_entry_id=config_entry.entry_id,
+        issue_id_pattern=f"^{issue_prefix}",
+    ):
+        for light in api.lights:
+            if api.lights.get_device(light.id) is None:
+                ir.async_keep_issue(hass, DOMAIN, f"{issue_prefix}{light.id}")
+        async_subscribe_lights(config_entry, api, async_add_plug)
 
 
 class HueSmartPlug(HueBaseEntity, SwitchEntity):
-    """Represent a Hue smart plug configured as an outlet switch."""
+    """Represent a Hue smart plug as an outlet switch."""
 
     controller: LightsController
     resource: Light
